@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Saga Orchestrator — Live Events</title>
+<style>
+  body { font-family: monospace; background: #0d1117; color: #c9d1d9; margin: 0; padding: 24px; }
+  h1   { color: #58a6ff; margin-bottom: 4px; }
+  p.sub { color: #8b949e; margin-top: 0; margin-bottom: 24px; }
+  .controls { display: flex; gap: 8px; margin-bottom: 20px; }
+  input  { background: #161b22; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 12px;
+           border-radius: 6px; font-family: monospace; width: 380px; }
+  button { background: #238636; border: none; color: #fff; padding: 8px 16px;
+           border-radius: 6px; cursor: pointer; font-family: monospace; }
+  button:hover { background: #2ea043; }
+  #status { margin-bottom: 12px; font-size: 13px; color: #8b949e; }
+  #events { list-style: none; padding: 0; margin: 0; }
+  #events li { padding: 10px 14px; border-left: 3px solid #30363d; margin-bottom: 6px;
+               background: #161b22; border-radius: 0 6px 6px 0; font-size: 13px; }
+  .COMPLETED   { border-left-color: #2ea043; }
+  .COMPENSATED { border-left-color: #e3b341; }
+  .DEAD_LETTER { border-left-color: #f85149; }
+  .EXECUTING   { border-left-color: #58a6ff; }
+  .COMPENSATING{ border-left-color: #d29922; }
+  .meta { color: #8b949e; font-size: 11px; margin-top: 4px; }
+</style>
+</head>
+<body>
+<h1>Saga Orchestrator</h1>
+<p class="sub">Live step-by-step execution events via WebSocket (STOMP over SockJS)</p>
+
+<div class="controls">
+  <input id="sagaId" type="text" placeholder="Paste saga UUID to subscribe…">
+  <button onclick="subscribe()">Subscribe</button>
+</div>
+<div id="status">Not connected</div>
+<ul id="events"></ul>
+
+<script src="https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
+<script>
+  var stompClient = null;
+  var subscription = null;
+
+  function connect(callback) {
+    if (stompClient && stompClient.connected) { callback(); return; }
+    var socket = new SockJS('/ws');
+    stompClient = Stomp.over(socket);
+    stompClient.debug = null;
+    stompClient.connect({}, function() {
+      document.getElementById('status').textContent = 'Connected';
+      callback();
+    }, function(err) {
+      document.getElementById('status').textContent = 'Connection error: ' + err;
+    });
+  }
+
+  function subscribe() {
+    var id = document.getElementById('sagaId').value.trim();
+    if (!id) return;
+    connect(function() {
+      if (subscription) subscription.unsubscribe();
+      document.getElementById('events').innerHTML = '';
+      document.getElementById('status').textContent = 'Subscribed to saga: ' + id;
+      subscription = stompClient.subscribe('/topic/sagas/' + id, function(msg) {
+        var e = JSON.parse(msg.body);
+        var li = document.createElement('li');
+        li.className = e.toStatus;
+        li.innerHTML =
+          '<strong>' + e.step + '</strong>' +
+          ' &nbsp; <span style="color:#8b949e">' + e.fromStatus + ' → ' + e.toStatus + '</span>' +
+          (e.durationMs > 0 ? ' &nbsp; <span style="color:#8b949e">' + e.durationMs + 'ms</span>' : '') +
+          (e.terminal ? ' &nbsp; <span style="color:#f0883e">TERMINAL</span>' : '') +
+          '<div class="meta">' + e.timestamp + '</div>';
+        document.getElementById('events').prepend(li);
+      });
+    });
+  }
+</script>
+</body>
+</html>

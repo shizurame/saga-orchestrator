@@ -1,0 +1,66 @@
+spring:
+  application:
+    name: saga-orchestrator
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/saga_orchestrator
+    username: postgres
+    password: postgres
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    open-in-view: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+
+  quartz:
+    job-store-type: jdbc
+    jdbc:
+      initialize-schema: always
+    properties:
+      org.quartz.scheduler.instanceName: SagaOrchestratorScheduler
+      org.quartz.scheduler.instanceId: AUTO
+      # Do NOT set org.quartz.jobStore.class here — Spring Boot sets it to LocalDataSourceJobStore
+      # and wires the application DataSource. Setting it manually overrides that wiring and breaks startup.
+      org.quartz.jobStore.driverDelegateClass: org.quartz.impl.jdbcjobstore.PostgreSQLDelegate
+      org.quartz.jobStore.tablePrefix: QRTZ_
+      org.quartz.jobStore.isClustered: true
+      org.quartz.jobStore.clusterCheckinInterval: 15000
+      org.quartz.threadPool.class: org.quartz.simpl.SimpleThreadPool
+      org.quartz.threadPool.threadCount: 10
+      org.quartz.threadPool.threadPriority: 5
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+saga:
+  orchestrator:
+    node-id: ${HOSTNAME:local-node}
+    lease-duration-seconds: 30
+    heartbeat-interval-seconds: 10
