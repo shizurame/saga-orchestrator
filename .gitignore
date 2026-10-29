@@ -16,3 +16,8 @@ benchmark-results.json
 
 # Environment files
 .env
+
+# Private interview-prep working files
+_prep/
+REVIEW_AND_FIXES.md
+SESSION_PROMPTS.md
