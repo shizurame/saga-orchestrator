@@ -1,7 +1,7 @@
 # Saga Orchestrator
 
 A distributed saga orchestrator built in Java 21 + Spring Boot 3.3, exercising the hardest
-correctness problems in multi-service financial workflows: exactly-once execution, crash
+correctness problems in multi-service financial workflows: effectively-once execution, crash
 recovery, timeout ambiguity, and compensation atomicity.
 
 ---
@@ -19,7 +19,7 @@ undo transactions in reverse — and doing so correctly under every failure mode
 
 | Problem | Mechanism |
 |---------|-----------|
-| **Exactly-once step execution** | Deterministic SHA-256 idempotency keys; write intent before acting |
+| **Effectively-once step execution** (deterministic key resend + idempotent participant) | Deterministic SHA-256 idempotency keys; write intent before acting |
 | **Crash recovery** | Heartbeat leases + fencing tokens; orphaned saga scanner resumes in ≤30s |
 | **Timeout ambiguity** | Three-mode semantics: retry-with-same-key, treat-as-failure, or park for callback |
 | **Compensation atomicity** | Full plan written in one transaction at the moment of failure, before first undo |
