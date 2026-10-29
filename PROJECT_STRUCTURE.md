@@ -109,7 +109,10 @@ engine/
 ├── CompensationEngine.java        ← drives compensations N..0 in reverse with per-step REQUIRES_NEW writes
 ├── CompensationPlanWriter.java    ← pure computation: builds List<CompensationStep> from definition
 ├── SagaStateMachine.java          ← pure function: (currentState, event) → nextState; no I/O
-├── StepPersistenceService.java    ← all @Transactional(REQUIRES_NEW) DB writes for step lifecycle
+├── StepPersistenceService.java    ← all @Transactional(REQUIRES_NEW) DB writes for step lifecycle;
+│                                     checks the fencing token before every state-mutating write
+├── FencedOutException.java        ← thrown when a tracked fencing token no longer matches the
+│                                     saga's current one; caught by ForwardExecutionEngine/CompensationEngine
 ├── TimeoutHandler.java            ← RETRY_WITH_IDEMPOTENCY retry; TREAT_AS_FAILURE compensation
 ├── StepActionExecutor.java        ← interface: execute(step, context, idempotencyKey, timeout)
 ├── BeanStepExecutor.java          ← wraps StepAction in CompletableFuture.get(timeout); virtual threads
@@ -152,7 +155,9 @@ infrastructure/
   use the same order, so circular wait is structurally impossible
 - `ON CONFLICT DO NOTHING` means competing sagas never block each other; conflict detected
   immediately via post-insert ownership check
-- Fencing token incremented on every claim; stale-node writes rejected via `WHERE fencing_token = N`
+- Fencing token incremented on every claim; stale-node writes rejected by an application-level
+  check in `engine/StepPersistenceService` (`FencedOutException`), not a SQL `WHERE` clause —
+  see ARCHITECTURE.md's "Fencing Tokens" section
 
 ---
 
@@ -283,7 +288,7 @@ benchmark/
 └── BenchmarkRunner.java           ← main() for standalone CLI execution
 ```
 
-Run via: `mvn test -Dgroups=benchmark -Dnet.bytebuddy.experimental=true`
+Run via: `mvn test -Pbenchmark`
 
 ---
 
@@ -297,7 +302,8 @@ test/java/com/saga/orchestrator/
 │   ├── SagaDefinitionRegistryTest.java   ← 5 tests: register/lookup, duplicate detection
 │   └── IdempotencyKeyGeneratorTest.java  ← same inputs → same key; separator collision test
 ├── engine/
-│   └── SagaStateMachineTest.java         ← 64 tests: all valid transitions + all invalid combinations
+│   ├── SagaStateMachineTest.java         ← 64 tests: all valid transitions + all invalid combinations
+│   └── StaleWriterRejectedTest.java      ← fencing check rejects a stale node's write; new owner succeeds
 ├── integration/
 │   ├── AbstractIntegrationTest.java      ← singleton Testcontainers PostgreSQL; Spring context cached
 │   ├── AbstractWebIntegrationTest.java   ← WebEnvironment.MOCK + MockMvc; shares same container
@@ -310,15 +316,19 @@ test/java/com/saga/orchestrator/
 │   ├── Phase7ControllerTest.java         ← REST API; entity lock 409; saga status endpoint
 │   ├── Phase8IntegrationTest.java        ← Prometheus metrics counters/timers; DLQ alerting
 │   ├── Phase8WebSocketTest.java          ← WebSocket events emitted per step
-│   ├── CrashAtEachStepTest.java          ← parameterized crash at steps 0..4; scanner recovers all
+│   ├── CrashAtEachStepTest.java          ← crash at a step boundary (0..4) AND genuinely mid-step
+│   │                                       (IN_PROGRESS row reused, not re-attempted) — scanner recovers all
 │   ├── ConcurrentSagaSameAccountTest.java ← entity lock serialization under WAIT_FOR_CALLBACK
 │   ├── CompensationUnderCrashTest.java   ← crash mid-compensation; scanner resumes correctly
 │   └── IdempotencyUnder1000RetriesTest.java ← 1000 concurrent callers, same key → 1 execution
+│                                             (proves the participant's cache, not the orchestrator's
+│                                              write path — see ARCHITECTURE.md)
 └── benchmark/
     └── BenchmarkSuiteTest.java           ← @Tag("benchmark"); runs JMH via Surefire
 ```
 
-164 tests total — all pass. Benchmarks excluded from default `mvn test`.
+169 tests total — all pass via plain `mvn test`. Benchmarks are a separate Maven profile
+(`mvn test -Pbenchmark`), not part of that count — see pom.xml's `benchmark` profile.
 
 ---
 

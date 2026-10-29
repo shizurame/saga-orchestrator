@@ -478,6 +478,71 @@ Measured with JMH 1.37, `@Fork(0)`, 2 warmup × 3 measurement iterations against
 | `sagaThroughput` | ~100 | ops/s | 5-step fund-transfer saga end-to-end, single-threaded |
 | `entityLockContention` | ~100 | ops/s | Per-account serialization with unique lock per iteration |
 
+*(Historical — from the original Phase 8 measurement. See BENCHMARK_RESULTS.md for the current
+numbers, re-measured 3× in isolation during the Phase 9 fixes below.)*
+
+---
+
+## Phase 9 — Post-Review Correctness Fixes (2026-10-29)
+
+**Goal:** A CV/interview review (`REVIEW_AND_FIXES.md`, not committed) flagged two claims that
+needed code to back them. Both turned out to be real gaps, and fixing the first uncovered a
+second, previously invisible bug.
+
+- [x] **Benchmark tag exclusion was a no-op.** `@Tag("benchmark")` alone does nothing under plain
+  JUnit 5 + Surefire; there was no `<excludedGroups>` or `junit-platform.properties` anywhere, so
+  `mvn test` silently ran the full JMH suite every time (~100s), contradicting every doc that
+  claimed otherwise. Fixed with two Maven profiles in `pom.xml` (`default-test-set`,
+  `activeByDefault`, excludes the `benchmark` tag; `benchmark`, run via `mvn test -Pbenchmark`,
+  includes only it). A naive `-DexcludedGroups=` command-line override does **not** actually
+  clear an already-set `<excludedGroups>` value in this Surefire version — found this out by
+  testing it, not by assuming — hence two profiles instead of one flag.
+- [x] **Mid-step crash recovery was untested and silently broken.** `CrashAtEachStepTest` only
+  ever simulated a crash at a step *boundary* (no step in flight). For a step genuinely
+  `IN_PROGRESS` when `OrphanedSagaScanner` claims the saga, `ForwardExecutionEngine` used to call
+  `persistIntent` for a fresh attempt 1, hit the `uq_step_attempt` unique constraint, log a
+  warning, and silently stop — verified this exact failure empirically with a throwaway test
+  before fixing it. The saga stayed claimed but made zero progress until the independent
+  `TimeoutScanner` happened to catch the same row later. Fixed: `executeWithRetry` now looks up
+  an existing `IN_PROGRESS` row via the new `StepPersistenceService.findInProgress` and reuses its
+  exact attempt number and idempotency key. New test:
+  `CrashAtEachStepTest.crashMidStep_recoveryReusesExistingKey`, parameterized across all 5 steps.
+- [x] **Fencing tokens were incremented on claim but never checked anywhere.**
+  `HeartbeatService.fencingToken()` had zero callers; `renewLease`/`releaseSaga` guard only on
+  `lock_owner`. Added `FencedOutException` and a `checkFencing()` guard in every
+  `StepPersistenceService` method that completes, fails, times out, or transitions a saga's
+  state, comparing the saga's current DB token against `HeartbeatService.trackedFencingToken`
+  (the token this node remembers claiming it with — `Optional`, so a saga this node never tracked
+  at all is intentionally not fenced). `ForwardExecutionEngine`/`CompensationEngine` catch it,
+  untrack, and stop, mirroring the existing OCC-loss-on-persistIntent pattern.
+- [x] **That check immediately surfaced a real bug.** `SagaInitializer.initialize()` claims the
+  saga (a native `UPDATE` that bumps `fencing_token` directly in the DB) but then calls
+  `sagaRepo.save()` on the same already-loaded entity, whose in-memory `fencingToken` was never
+  refreshed — silently writing `fencing_token` back to `0` for every newly started saga. Nothing
+  ever compared the value before, so this had zero observable effect until the new check made it
+  one. Fixed by syncing `saga.setFencingToken(fencing.getAsLong())` from the claim result before
+  that save.
+- [x] New test: `StaleWriterRejectedTest` (`engine/` package, so it can reach the package-private
+  `StepPersistenceService` directly) — node A claims (token 1) and persists an intent; node B
+  steals the lease (token 2); A's write is rejected with `FencedOutException` and changes nothing;
+  B's retry with the correct token succeeds and the saga reaches `COMPLETED`.
+
+### Phase 9 Notes
+- `@Version` on `saga_instance` turned out **not** to be the redundant safety net the original
+  review assumed — `claimSaga`'s native `UPDATE` never touches `version`, so a stale node doing a
+  fresh `findById` + save inside its own transaction sees no version conflict at all. The explicit
+  fencing check is the only thing that actually closes that gap, not a defense-in-depth layer on
+  top of something already safe.
+- Design decision on untracked sagas: fail-open, not fail-closed. If `HeartbeatService` has no
+  entry for a saga at all (as opposed to a stale one), the write proceeds unchecked. This keeps
+  every existing test that calls engine methods directly (bypassing `claimSaga`/`track`) passing
+  unmodified, and matches the actual danger case — a GC-paused node always has a *stale tracked*
+  token in memory, never a missing one.
+- 169/169 tests pass via plain `mvn test`: 163 non-benchmark tests from Phases 0–8 (the
+  historical "164" already counted `BenchmarkSuiteTest` as one of the 164 despite being
+  documented as excluded — itself a symptom of the benchmark-tag-exclusion bug above) + 5 new
+  `crashMidStep_recoveryReusesExistingKey` cases + 1 new `StaleWriterRejectedTest`.
+
 ---
 
 ## CV Bullets — Final (with benchmark numbers)

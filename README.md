@@ -1,8 +1,8 @@
 # Saga Orchestrator
 
-A production-grade distributed saga orchestrator built in Java 21 + Spring Boot 3.3.
-Designed to solve the hardest correctness problems in multi-service financial workflows:
-exactly-once execution, crash recovery, timeout ambiguity, and compensation atomicity.
+A distributed saga orchestrator built in Java 21 + Spring Boot 3.3, exercising the hardest
+correctness problems in multi-service financial workflows: exactly-once execution, crash
+recovery, timeout ambiguity, and compensation atomicity.
 
 ---
 
@@ -24,7 +24,7 @@ undo transactions in reverse — and doing so correctly under every failure mode
 | **Timeout ambiguity** | Three-mode semantics: retry-with-same-key, treat-as-failure, or park for callback |
 | **Compensation atomicity** | Full plan written in one transaction at the moment of failure, before first undo |
 | **Concurrent saga serialization** | Entity lock table with `ON CONFLICT DO NOTHING`; canonical sort prevents deadlock |
-| **Stale-writer rejection** | Fencing token checked on every state write; GC-paused nodes cannot corrupt state |
+| **Stale-writer rejection** | Fencing token checked before every saga-state write; a GC-paused node's stale write is rejected once another node has claimed the saga |
 | **Step classification** | DSL enforces `COMPENSATABLE* → PIVOT? → RETRYABLE*` at build time, not runtime |
 
 ---
@@ -88,11 +88,11 @@ The participant returns its cached result. Exactly one execution, regardless of 
 # Start PostgreSQL
 docker-compose up -d
 
-# Run all tests (164 tests including chaos and integration)
+# Run all tests (169 tests including chaos and integration; benchmarks excluded)
 mvn test
 
-# Run benchmarks (excluded from default test run)
-mvn test -Dgroups=benchmark -Dnet.bytebuddy.experimental=true
+# Run benchmarks only (separate Maven profile — see pom.xml)
+mvn test -Pbenchmark
 
 # Start the application
 mvn spring-boot:run
@@ -130,14 +130,16 @@ curl -X POST http://localhost:8080/sagas \
 
 ## Benchmark Results
 
-Measured with JMH 1.37, `@Fork(0)`, against Testcontainers PostgreSQL 16 (Apple Silicon, Java 21).
+Measured with JMH 1.37, `@Fork(0)`, against Testcontainers PostgreSQL 16 (Apple M3, Java 21).
+Median of 3 isolated runs on 2026-10-29 (`mvn test -Pbenchmark`); see BENCHMARK_RESULTS.md for
+the full range and per-run numbers — the error bars on these are wide (3 iterations, `@Fork(0)`).
 
-| Benchmark | Score | Unit | What it measures |
-|-----------|-------|------|-----------------|
-| `sagaStepLatency` | **2,084 ± 598** | µs/op | 1-step saga: 3 REQUIRES_NEW DB round-trips |
-| `compensationLatency` | **4,957 ± 1,080** | µs/op | 2-step failure → COMPENSATED: 8 DB writes |
-| `sagaThroughput` | ~100 | ops/s | 5-step fund-transfer, single-threaded |
-| `entityLockContention` | ~100 | ops/s | Per-account serialization per iteration |
+| Benchmark | Median | Range | Unit | What it measures |
+|-----------|--------|-------|------|-----------------|
+| `sagaStepLatency` | **2,551** | 2,277–2,567 | µs/op | 1-step saga: 3 REQUIRES_NEW DB round-trips |
+| `compensationLatency` | **5,593** | 5,199–6,420 | µs/op | 2-step failure → COMPENSATED: 8 DB writes |
+| `sagaThroughput` | ~144 | — | ops/s | 5-step fund-transfer, single-threaded |
+| `entityLockContention` | ~137 | — | ops/s | Per-account serialization per iteration |
 
 See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full interpretation.
 
@@ -147,15 +149,19 @@ See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full interpretation.
 
 | Test | What it proves |
 |------|----------------|
-| `CrashAtEachStepTest` (parameterized 0..4) | Scanner claims and resumes correctly from any crash point |
-| `IdempotencyUnder1000RetriesTest` | 1000 concurrent callers with the same key → exactly 1 execution |
+| `CrashAtEachStepTest.crashAtStep_recoveryResumesSagaToCompleted` (parameterized 0..4) | Scanner claims and resumes correctly from a crash at a step *boundary* (no step in flight) |
+| `CrashAtEachStepTest.crashMidStep_recoveryReusesExistingKey` (parameterized 0..4) | Scanner resumes a step genuinely IN_PROGRESS (crash between intent and result) by reusing the existing row/key, not starting a new attempt |
+| `StaleWriterRejectedTest` | A node whose fencing token is stale gets `FencedOutException` and writes nothing; the new owner's write with the correct token succeeds |
+| `IdempotencyUnder1000RetriesTest` | 1000 concurrent callers with the same key → exactly 1 execution (proves the **participant's** dedup cache, not the orchestrator's write path — see ARCHITECTURE.md) |
 | `ConcurrentSagaSameAccountTest` | Entity lock serializes two sagas; second blocked until first completes |
 | `CompensationUnderCrashTest` | Mid-compensation crash; scanner resumes; all steps compensated |
 | `Phase5IntegrationTest` | Reverse ordering; crash recovery; idempotent compensation |
 | `Phase6IntegrationTest` | All three timeout modes; callback delivery; orphan recovery |
 
-164 tests, 0 mocks for the database — all integration tests run against a real PostgreSQL instance
+169 tests, 0 mocks for the database — all integration tests run against a real PostgreSQL instance
 via Testcontainers. Quartz auto-startup disabled in tests; scanner services are injected directly.
+Benchmarks (`BenchmarkSuiteTest`, JMH) are a separate Maven profile (`mvn test -Pbenchmark`), not
+part of this count.
 
 ---
 

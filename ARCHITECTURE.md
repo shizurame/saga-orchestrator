@@ -316,11 +316,26 @@ Both succeed if the only protection is the lease check — node B already update
 node A's write doesn't check the lease at all.
 
 With fencing tokens: node A received token 41 when it claimed the saga. Node B claimed with token
-42. Every state-transition UPDATE by node A includes `WHERE fencing_token = 41`. Node B's claim
-set `fencing_token = 42`. Node A's UPDATE returns 0 rows. Node A detects this, logs a warning,
-and stops processing. Node B is the sole writer.
+42. The check is application-level, not a SQL `WHERE` clause on the UPDATE itself:
+`StepPersistenceService` loads the saga fresh inside every write method that completes, fails,
+times out, or transitions a saga (`persistStepSuccess`, `transitionToCompensating`,
+`releaseLocksAndTransition`, etc.), and before mutating anything compares the row's current
+`fencing_token` (42, after node B's claim) against `HeartbeatService.trackedFencingToken(sagaId)`
+— the token node A remembers claiming it with (41). On mismatch it throws `FencedOutException`
+*before* any write in that method, rolling back only that method's own `REQUIRES_NEW`
+transaction. `ForwardExecutionEngine`/`CompensationEngine` catch it, log, untrack the saga, and
+stop — node B is the sole writer from that point on.
 
-**The fencing token is the reason `lock_owner` alone is not sufficient.**
+A saga this node never tracked at all (no prior `claimSaga`/`track` call — e.g. an engine method
+invoked directly, as several tests do) is intentionally **not** fenced; see `FencedOutException`'s
+javadoc. The check only protects a node against its own stale belief about a saga it did,
+at some point, legitimately claim.
+
+**The fencing token is the reason `lock_owner` alone is not sufficient** — and `@Version` alone
+is not sufficient either: `claimSaga`'s native `UPDATE` bumps `fencing_token` directly in SQL
+without touching `version`, so a stale node doing a fresh `findById` + save inside its own
+transaction sees no version conflict at all. The explicit fencing check above is what actually
+closes this gap.
 
 ### Recovery After Crash
 
@@ -332,7 +347,12 @@ WHERE status IN ('EXECUTING', 'COMPENSATING', 'WAITING_FOR_CALLBACK')
 ```
 
 For each orphaned saga: claim it (via the claim UPDATE above), re-read current state, resume from
-last persisted step using the already-persisted `attempt_number` and the deterministic key.
+last persisted step using the already-persisted `attempt_number` and the deterministic key —
+including a step that crashed genuinely mid-flight (intent persisted, result never was):
+`ForwardExecutionEngine` looks up an `IN_PROGRESS` row for the step being resumed and reuses its
+exact `attemptNumber`/idempotency key rather than starting a fresh attempt, which would otherwise
+violate the `uq_step_attempt` constraint and silently stall until the independent
+`TimeoutScanner` happened to catch the same row later.
 
 ---
 
