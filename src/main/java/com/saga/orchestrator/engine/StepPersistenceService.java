@@ -106,11 +106,13 @@ class StepPersistenceService {
     public SagaInstance persistStepSuccess(UUID sagaId, UUID executionId,
                                            Object result, String contextJson,
                                            boolean isLastStep, String stepName) {
+        SagaInstance saga = sagaRepo.findById(sagaId).orElseThrow();
+        checkFencing(saga);
+
         SagaStepExecution exec = stepRepo.findById(executionId).orElseThrow();
         exec.markCompleted(toJson(result));
         stepRepo.save(exec);
 
-        SagaInstance saga = sagaRepo.findById(sagaId).orElseThrow();
         SagaStatus fromStatus = saga.getStatus();
         long started = exec.getStartedAt().toEpochMilli();
 
@@ -142,6 +144,8 @@ class StepPersistenceService {
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void persistStepFailure(UUID sagaId, UUID executionId, String error) {
+        checkFencing(sagaRepo.findById(sagaId).orElseThrow());
+
         SagaStepExecution exec = stepRepo.findById(executionId).orElseThrow();
         exec.markFailed(toJson(error));
         stepRepo.save(exec);
@@ -150,6 +154,8 @@ class StepPersistenceService {
     /** Marks step TIMED_OUT; timeout-mode routing is done by the caller. */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void persistStepTimeout(UUID sagaId, UUID executionId) {
+        checkFencing(sagaRepo.findById(sagaId).orElseThrow());
+
         SagaStepExecution exec = stepRepo.findById(executionId).orElseThrow();
         exec.markTimedOut();
         stepRepo.save(exec);
@@ -163,6 +169,7 @@ class StepPersistenceService {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void transitionSaga(UUID sagaId, SagaEvent event, String stepName) {
         SagaInstance saga = sagaRepo.findById(sagaId).orElseThrow();
+        checkFencing(saga);
         SagaStatus from = saga.getStatus();
         SagaStatus to   = stateMachine.transition(from, event);
         saga.setStatus(to);
@@ -188,9 +195,11 @@ class StepPersistenceService {
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void transitionToCompensating(UUID sagaId, List<CompensationStep> plan, String stepName) {
+        SagaInstance saga = sagaRepo.findById(sagaId).orElseThrow();
+        checkFencing(saga);
+
         compensationStepRepo.saveAll(plan);
 
-        SagaInstance saga = sagaRepo.findById(sagaId).orElseThrow();
         SagaStatus from = saga.getStatus();
         SagaStatus to   = stateMachine.transition(from, SagaEvent.STEP_FAILED);
         saga.setStatus(to);
@@ -221,10 +230,12 @@ class StepPersistenceService {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void persistCompensationSuccess(UUID compStepId, String resultJson) {
         CompensationStep cs = compensationStepRepo.findById(compStepId).orElseThrow();
+        SagaInstance saga = sagaRepo.findById(cs.getSagaId()).orElseThrow();
+        checkFencing(saga);
+
         cs.markCompleted(resultJson);
         compensationStepRepo.save(cs);
 
-        SagaInstance saga = sagaRepo.findById(cs.getSagaId()).orElseThrow();
         eventPublisher.publish(new SagaExecutionEvent(
                 saga.getId(), saga.getSagaType(), cs.getAction(),
                 SagaStatus.COMPENSATING, SagaStatus.COMPENSATING, Instant.now(), 0L));
@@ -237,6 +248,8 @@ class StepPersistenceService {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void persistCompensationFailure(UUID compStepId) {
         CompensationStep cs = compensationStepRepo.findById(compStepId).orElseThrow();
+        checkFencing(sagaRepo.findById(cs.getSagaId()).orElseThrow());
+
         cs.markFailed();
         compensationStepRepo.save(cs);
     }
@@ -254,10 +267,12 @@ class StepPersistenceService {
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void releaseLocksAndTransition(UUID sagaId, SagaEvent event, String stepName) {
+        SagaInstance saga = sagaRepo.findById(sagaId).orElseThrow();
+        checkFencing(saga);
+
         // Lock release joins this REQUIRES_NEW TX (EntityLockManager uses default REQUIRED propagation)
         entityLockManager.releaseAllLocksForSaga(sagaId);
 
-        SagaInstance saga = sagaRepo.findById(sagaId).orElseThrow();
         SagaStatus from = saga.getStatus();
         SagaStatus to   = stateMachine.transition(from, event);
         saga.setStatus(to);
@@ -292,6 +307,9 @@ class StepPersistenceService {
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void persistCallbackSuccess(UUID sagaId, int stepIndex, boolean isLastStep, String stepName) {
+        SagaInstance saga = sagaRepo.findById(sagaId).orElseThrow();
+        checkFencing(saga);
+
         SagaStepExecution exec = stepRepo
                 .findBySagaIdAndStepIndexAndStatus(sagaId, stepIndex, StepExecutionStatus.TIMED_OUT)
                 .orElseThrow(() -> new IllegalStateException(
@@ -299,7 +317,6 @@ class StepPersistenceService {
         exec.markCompleted(null);
         stepRepo.save(exec);
 
-        SagaInstance saga = sagaRepo.findById(sagaId).orElseThrow();
         SagaStatus from = saga.getStatus(); // WAITING_FOR_CALLBACK
         SagaEvent event = isLastStep ? SagaEvent.SAGA_COMPLETED : SagaEvent.CALLBACK_SUCCESS;
         SagaStatus to   = stateMachine.transition(from, event);
@@ -322,6 +339,8 @@ class StepPersistenceService {
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void persistCallbackFailure(UUID sagaId, int stepIndex) {
+        checkFencing(sagaRepo.findById(sagaId).orElseThrow());
+
         SagaStepExecution exec = stepRepo
                 .findBySagaIdAndStepIndexAndStatus(sagaId, stepIndex, StepExecutionStatus.TIMED_OUT)
                 .orElseThrow(() -> new IllegalStateException(
@@ -331,6 +350,21 @@ class StepPersistenceService {
     }
 
     // ── Utilities ─────────────────────────────────────────────────────────────
+
+    /**
+     * Rejects a write for a saga this node tracks with a stale fencing token — i.e.
+     * another node has since claimed it (lease steal or crash recovery) and this node's
+     * belief about owning it is out of date. A saga this node never tracked at all is not
+     * checked: see HeartbeatService.trackedFencingToken and FencedOutException's javadoc
+     * for why that is intentional, not an oversight.
+     */
+    private void checkFencing(SagaInstance saga) {
+        heartbeatService.trackedFencingToken(saga.getId()).ifPresent(tracked -> {
+            if (!tracked.equals(saga.getFencingToken())) {
+                throw new FencedOutException(saga.getId(), tracked, saga.getFencingToken());
+            }
+        });
+    }
 
     private String toJson(Object value) {
         if (value == null) return null;

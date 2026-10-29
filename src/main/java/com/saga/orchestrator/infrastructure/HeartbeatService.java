@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Instant;
 import java.util.Collections;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -56,6 +57,16 @@ public class HeartbeatService {
         Long token = ownedSagas.get(sagaId);
         if (token == null) throw new IllegalStateException("Saga not tracked by this node: " + sagaId);
         return token;
+    }
+
+    /**
+     * Fencing token this node tracked at claim/resume time, if it currently tracks this
+     * saga at all. Unlike {@link #fencingToken(UUID)}, this never throws: a saga this node
+     * never tracked (e.g. a test or recovery flow that calls engine methods directly without
+     * claiming first) is intentionally not fenced — see FencedOutException's javadoc.
+     */
+    public Optional<Long> trackedFencingToken(UUID sagaId) {
+        return Optional.ofNullable(ownedSagas.get(sagaId));
     }
 
     public Set<UUID> ownedSagaIds() {

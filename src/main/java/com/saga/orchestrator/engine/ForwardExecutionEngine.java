@@ -2,6 +2,7 @@ package com.saga.orchestrator.engine;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.saga.orchestrator.definition.*;
+import com.saga.orchestrator.infrastructure.HeartbeatService;
 import com.saga.orchestrator.infrastructure.IdempotencyKeyGenerator;
 import com.saga.orchestrator.persistence.entity.CompensationStep;
 import com.saga.orchestrator.persistence.entity.SagaInstance;
@@ -51,17 +52,20 @@ public class ForwardExecutionEngine {
     private final IdempotencyKeyGenerator keyGenerator;
     private final CompensationPlanWriter planWriter;
     private final ObjectMapper           objectMapper;
+    private final HeartbeatService       heartbeatService;
 
     public ForwardExecutionEngine(StepPersistenceService persistence,
                                   StepExecutorFactory executorFactory,
                                   IdempotencyKeyGenerator keyGenerator,
                                   CompensationPlanWriter planWriter,
-                                  ObjectMapper objectMapper) {
+                                  ObjectMapper objectMapper,
+                                  HeartbeatService heartbeatService) {
         this.persistence    = persistence;
         this.executorFactory = executorFactory;
         this.keyGenerator   = keyGenerator;
         this.planWriter     = planWriter;
         this.objectMapper   = objectMapper;
+        this.heartbeatService = heartbeatService;
     }
 
     /**
@@ -73,12 +77,20 @@ public class ForwardExecutionEngine {
         UUID sagaId       = saga.getId();
         SagaContext context = deserializeContext(saga, definition);
 
-        for (int i = startStepIndex; i < definition.stepCount(); i++) {
-            SagaStep step = definition.stepAt(i);
-            boolean last  = (i == definition.stepCount() - 1);
+        try {
+            for (int i = startStepIndex; i < definition.stepCount(); i++) {
+                SagaStep step = definition.stepAt(i);
+                boolean last  = (i == definition.stepCount() - 1);
 
-            boolean proceed = executeWithRetry(sagaId, step, i, last, definition, context);
-            if (!proceed) return; // failure, timeout, or OCC loss — engine stops
+                boolean proceed = executeWithRetry(sagaId, step, i, last, definition, context);
+                if (!proceed) return; // failure, timeout, or OCC loss — engine stops
+            }
+        } catch (FencedOutException e) {
+            // Another node has claimed this saga since we started — stop immediately.
+            // Whatever write triggered this was rolled back in its own REQUIRES_NEW TX;
+            // the new owner is the sole writer from here on.
+            log.warn("{} — stopping forward execution for this node", e.getMessage());
+            heartbeatService.untrack(sagaId);
         }
     }
 

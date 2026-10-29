@@ -65,7 +65,12 @@ class SagaInitializer {
             throw new IllegalStateException("Failed to claim newly created saga: " + sagaId);
         }
 
-        // 4. Transition to EXECUTING (directly — no state machine for init; STARTED→EXECUTING)
+        // 4. Transition to EXECUTING (directly — no state machine for init; STARTED→EXECUTING).
+        // claimSaga's native UPDATE bumped fencing_token in the DB directly, bypassing this
+        // already-managed entity's in-memory copy (still 0, from createWithId). Without
+        // explicitly syncing it here, the save() below would write the stale in-memory value
+        // back over the DB's correct one, silently resetting fencing_token to 0.
+        saga.setFencingToken(fencing.getAsLong());
         saga.setStatus(SagaStatus.EXECUTING);
         sagaRepo.save(saga);
 

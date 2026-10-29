@@ -2,6 +2,7 @@ package com.saga.orchestrator.engine;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.saga.orchestrator.definition.*;
+import com.saga.orchestrator.infrastructure.HeartbeatService;
 import com.saga.orchestrator.persistence.entity.CompensationStep;
 import com.saga.orchestrator.persistence.entity.SagaInstance;
 import com.saga.orchestrator.persistence.repository.CompensationStepRepository;
@@ -41,13 +42,16 @@ public class CompensationEngine {
     private final StepPersistenceService persistence;
     private final CompensationStepRepository compensationStepRepo;
     private final ObjectMapper objectMapper;
+    private final HeartbeatService heartbeatService;
 
     CompensationEngine(StepPersistenceService persistence,
                        CompensationStepRepository compensationStepRepo,
-                       ObjectMapper objectMapper) {
+                       ObjectMapper objectMapper,
+                       HeartbeatService heartbeatService) {
         this.persistence          = persistence;
         this.compensationStepRepo = compensationStepRepo;
         this.objectMapper         = objectMapper;
+        this.heartbeatService     = heartbeatService;
     }
 
     /**
@@ -65,6 +69,18 @@ public class CompensationEngine {
 
         SagaContext context = deserializeContext(saga, definition);
 
+        try {
+            compensateRemaining(sagaId, definition, context);
+        } catch (FencedOutException e) {
+            // Another node has claimed this saga since we started — stop immediately.
+            // Whatever write triggered this was rolled back in its own REQUIRES_NEW TX;
+            // the new owner is the sole writer from here on.
+            log.warn("{} — stopping compensation for this node", e.getMessage());
+            heartbeatService.untrack(sagaId);
+        }
+    }
+
+    private void compensateRemaining(UUID sagaId, SagaDefinition<?> definition, SagaContext context) {
         // Load PENDING and IN_PROGRESS — handles both fresh starts and crash recovery.
         // Repository returns rows in DESC step_index order (reverse execution order).
         List<CompensationStep> remaining = compensationStepRepo
