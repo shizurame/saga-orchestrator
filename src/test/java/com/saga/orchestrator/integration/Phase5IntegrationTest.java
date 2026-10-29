@@ -55,6 +55,7 @@ class Phase5IntegrationTest extends AbstractIntegrationTest {
     private static final String COMP_RETRY_TYPE      = "phase5-comp-retry";
     private static final String COMP_FAILED_RETRY_TYPE     = "phase5-comp-failed-retry";
     private static final String COMP_FAILED_EXHAUSTED_TYPE = "phase5-comp-failed-exhausted";
+    private static final String DEAD_LETTER_TYPE           = "phase5-dead-letter";
 
     // Static so lambdas registered on the first JUnit instance write to the same
     // objects that each test's assertions read (JUnit creates a new instance per test
@@ -67,6 +68,7 @@ class Phase5IntegrationTest extends AbstractIntegrationTest {
     private static final AtomicInteger compFailedRetryStep0Count     = new AtomicInteger(0);
     private static final AtomicInteger compExhaustedStep1Count       = new AtomicInteger(0);
     private static final AtomicInteger compExhaustedStep0Count       = new AtomicInteger(0);
+    private static final AtomicInteger deadLetterCompCount           = new AtomicInteger(0);
 
     private static boolean registered = false;
 
@@ -80,6 +82,7 @@ class Phase5IntegrationTest extends AbstractIntegrationTest {
         compFailedRetryStep0Count.set(0);
         compExhaustedStep1Count.set(0);
         compExhaustedStep0Count.set(0);
+        deadLetterCompCount.set(0);
 
         if (registered) return;
         registered = true;
@@ -199,6 +202,22 @@ class Phase5IntegrationTest extends AbstractIntegrationTest {
                 .retryPolicy(RetryPolicy.fixed(2, Duration.ZERO))
             .build();
         registry.register(compFailedExhausted);
+
+        // Saga 9: 2 COMPENSATABLE steps; step 1 fails; step 0's compensation always fails
+        // with maxAttempts=2 — used for the end-to-end DEAD_LETTER test (genuine exhaustion
+        // through CompensationEngine itself, no crash simulation or direct row construction).
+        SagaDefinition<TestCtx> deadLetter = SagaDefinition.named(DEAD_LETTER_TYPE, TestCtx.class)
+            .compensatableStep("dl-comp-step-0")
+                .action((ctx, key) -> new ExecutionResult.Success(null))
+                .compensation((ctx, key) -> { deadLetterCompCount.incrementAndGet(); return new ExecutionResult.Failure("comp always fails"); })
+                .timeout(Duration.ofSeconds(5), TimeoutMode.RETRY_WITH_IDEMPOTENCY)
+                .retryPolicy(RetryPolicy.fixed(2, Duration.ZERO))
+            .compensatableStep("dl-comp-step-1")
+                .action((ctx, key) -> new ExecutionResult.Failure("step 1 fails"))
+                .compensation((ctx, key) -> new ExecutionResult.Success(null))
+                .timeout(Duration.ofSeconds(5), TimeoutMode.RETRY_WITH_IDEMPOTENCY)
+            .build();
+        registry.register(deadLetter);
     }
 
     @AfterEach
@@ -452,5 +471,41 @@ class Phase5IntegrationTest extends AbstractIntegrationTest {
         assertThat(compExhaustedStep0Count.get())
                 .as("step 0 must never run — step 1 (checked first, DESC order) is already dead-lettered")
                 .isEqualTo(0);
+    }
+
+    // ── Test 9: genuine compensation exhaustion reaches DEAD_LETTER end to end ──
+    //
+    // Unlike the DLQ-monitor test (Phase8IntegrationTest, which inserts a DEAD_LETTER row
+    // directly), this drives the whole thing through a normal startSaga call: step 1 fails,
+    // step 0's compensation always fails too and genuinely exhausts its retries through
+    // CompensationEngine itself.
+
+    @Test
+    void compensationGenuinelyExhausted_reachesDeadLetter_withLocksReleased() throws Exception {
+        String ctxJson = objectMapper.writeValueAsString(new TestCtx());
+        String entityId = "dl-acc-" + UUID.randomUUID().toString().substring(0, 8);
+
+        UUID sagaId = orchestrator.startSaga(DEAD_LETTER_TYPE, ctxJson,
+                List.of(new EntityRef("account", entityId)));
+
+        SagaInstance saga = sagaRepo.findById(sagaId).orElseThrow();
+        assertThat(saga.getStatus())
+                .as("step 0's compensation must genuinely exhaust its 2 attempts and reach DEAD_LETTER")
+                .isEqualTo(SagaStatus.DEAD_LETTER);
+
+        assertThat(deadLetterCompCount.get())
+                .as("step 0's compensation must actually be tried the full 2 times")
+                .isEqualTo(2);
+
+        List<CompensationStep> comps = compStepRepo.findBySagaIdOrderByStepIndexAsc(sagaId);
+        assertThat(comps).hasSize(1); // step 1 failed and was never completed, so no comp entry for it
+        assertThat(comps.get(0).getStepIndex()).isEqualTo(0);
+        assertThat(comps.get(0).getStatus()).isEqualTo(CompensationStatus.FAILED);
+        assertThat(comps.get(0).getAttemptNumber()).isEqualTo(2);
+
+        assertThat(lockRepo.findAll())
+                .as("DEAD_LETTER must still release entity locks — a saga requiring manual " +
+                        "intervention cannot hold up every other saga on that entity forever")
+                .isEmpty();
     }
 }
