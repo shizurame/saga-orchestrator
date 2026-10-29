@@ -38,7 +38,7 @@ class ApplicationSmokeTest extends AbstractIntegrationTest {
     }
 
     @Test
-    void flywayAppliedAllFourMigrations() throws SQLException {
+    void flywayAppliedAllMigrations() throws SQLException {
         int count;
         try (var conn = dataSource.getConnection();
              var stmt = conn.createStatement();
@@ -47,7 +47,7 @@ class ApplicationSmokeTest extends AbstractIntegrationTest {
             rs.next();
             count = rs.getInt(1);
         }
-        // V1 through V4 — adjust this number as migrations are added in later phases
-        assertThat(count).isEqualTo(4);
+        // V1 through V5 — adjust this number as migrations are added in later rounds
+        assertThat(count).isEqualTo(5);
     }
 }

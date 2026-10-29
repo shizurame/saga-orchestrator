@@ -56,6 +56,14 @@ public class SagaStepExecution {
     @Column(columnDefinition = "jsonb")
     private String error;
 
+    // Detects two concurrent callers racing to complete/fail the same row — e.g. one
+    // legitimately finishing it while another mistakes the still-in-flight IN_PROGRESS row
+    // for an abandoned one to resume. A plain read-then-write status check still has a gap
+    // between reading and committing; @Version closes it atomically, same as SagaInstance's.
+    @Version
+    @Column(nullable = false)
+    private Long version;
+
     protected SagaStepExecution() {}
 
     public static SagaStepExecution createInProgress(
@@ -69,6 +77,7 @@ public class SagaStepExecution {
         e.status = StepExecutionStatus.IN_PROGRESS;
         e.timeoutAt = timeoutAt;
         e.startedAt = Instant.now();
+        e.version = 0L; // explicit, like SagaInstance.version — see its own comment for why
         return e;
     }
 

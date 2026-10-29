@@ -114,10 +114,28 @@ class StepPersistenceService {
     public SagaInstance persistStepSuccess(UUID sagaId, UUID executionId,
                                            Object result, String contextJson,
                                            boolean isLastStep, String stepName) {
+        SagaStepExecution exec = stepRepo.findById(executionId).orElseThrow();
+        if (exec.getStatus() == StepExecutionStatus.COMPLETED) {
+            // Fast path: another concurrent caller already completed this exact execution
+            // row by the time we got here — e.g. two callers racing on the same saga/step,
+            // one of which mistook an actively in-flight IN_PROGRESS row for an abandoned
+            // one to resume. Nothing written yet on this call; stand down.
+            return sagaRepo.findById(sagaId).orElseThrow();
+        }
+
         SagaInstance saga = sagaRepo.findById(sagaId).orElseThrow();
         checkFencing(saga);
 
-        SagaStepExecution exec = stepRepo.findById(executionId).orElseThrow();
+        // exec's own @Version closes the gap between this method's status read above and
+        // another concurrent caller's commit — a plain read-then-write check alone can't
+        // detect a completion landing in exactly that window. If that happens, this save
+        // throws ObjectOptimisticLockingFailureException. It must propagate out of this
+        // REQUIRES_NEW method uncaught rather than being caught here: once a JPA flush
+        // fails, this transaction's persistence context is no longer usable for further
+        // work — Spring marks it rollback-only regardless, so catching the exception here
+        // and returning normally only trades it for an UnexpectedRollbackException at
+        // commit. The caller (ForwardExecutionEngine) catches it instead, the same way it
+        // already catches persistIntent's uq_step_attempt conflict.
         exec.markCompleted(toJson(result));
         stepRepo.save(exec);
 

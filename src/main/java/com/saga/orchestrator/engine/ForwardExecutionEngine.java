@@ -10,6 +10,7 @@ import com.saga.orchestrator.persistence.entity.SagaStepExecution;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
@@ -121,7 +122,13 @@ public class ForwardExecutionEngine {
             startAttempt = resuming.get().getAttemptNumber();
         } else {
             Optional<SagaStepExecution> latest = persistence.findLatestAttempt(sagaId, stepIndex);
-            if (latest.isPresent() && latest.get().getAttemptNumber() >= maxAttempts) {
+            if (latest.isPresent() && latest.get().getStatus() == StepExecutionStatus.COMPLETED) {
+                // Another concurrent caller for this same saga already completed this exact
+                // step (e.g. two racing executeFromStep calls) — nothing left to do here.
+                return true;
+            }
+            if (latest.isPresent() && latest.get().getStatus() == StepExecutionStatus.FAILED
+                    && latest.get().getAttemptNumber() >= maxAttempts) {
                 log.warn("Step '{}' saga={} already exhausted all {} attempts before this resume " +
                         "(crash before the compensate-or-fail decision committed) — deciding now",
                         step.name(), sagaId, maxAttempts);
@@ -161,9 +168,20 @@ public class ForwardExecutionEngine {
             // Step 3: persist result
             if (result instanceof ExecutionResult.Success success) {
                 String contextJson = serializeContext(context);
-                persistence.persistStepSuccess(
-                        sagaId, execution.getId(), success.result(),
-                        contextJson, isLastStep, step.name());
+                try {
+                    persistence.persistStepSuccess(
+                            sagaId, execution.getId(), success.result(),
+                            contextJson, isLastStep, step.name());
+                } catch (ObjectOptimisticLockingFailureException e) {
+                    // Another concurrent caller already completed this exact execution row
+                    // first (e.g. two callers racing on the same saga/step, one of which
+                    // mistook this row's IN_PROGRESS state for abandoned rather than actively
+                    // in flight) — that caller's own executeFromStep loop already continues
+                    // the saga; this thread just stands down, same as an OCC loss on persistIntent.
+                    log.warn("OCC: another caller already completed saga={} step={} attempt={}",
+                            sagaId, stepIndex, attempt);
+                    return false;
+                }
                 return true; // advance to next step
 
             } else if (result instanceof ExecutionResult.Failure failure) {
