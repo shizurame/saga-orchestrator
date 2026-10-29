@@ -2,6 +2,7 @@ package com.saga.orchestrator.integration;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.saga.orchestrator.definition.SagaStatus;
+import com.saga.orchestrator.infrastructure.IdempotencyKeyGenerator;
 import com.saga.orchestrator.persistence.entity.SagaInstance;
 import com.saga.orchestrator.persistence.repository.SagaInstanceRepository;
 import com.saga.orchestrator.scanning.OrphanedSagaScanService;
@@ -16,6 +17,8 @@ import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -40,6 +43,7 @@ class CrashAtEachStepTest extends AbstractIntegrationTest {
     @Autowired SagaInstanceRepository  sagaRepo;
     @Autowired JdbcTemplate            jdbcTemplate;
     @Autowired ObjectMapper            objectMapper;
+    @Autowired IdempotencyKeyGenerator keyGenerator;
     @Autowired CreditCheckService      creditCheckService;
     @Autowired FundReservationService  fundReservationService;
     @Autowired DebitService            debitService;
@@ -93,6 +97,75 @@ class CrashAtEachStepTest extends AbstractIntegrationTest {
                 .isEqualTo(SagaStatus.COMPLETED);
 
         // Entity lock must be cleaned up after terminal transition
+        Integer lockCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM saga_entity_locks WHERE saga_id = ?",
+                Integer.class, sagaId);
+        assertThat(lockCount).as("entity locks must be released on COMPLETED").isEqualTo(0);
+    }
+
+    /**
+     * Crash mid-step (not at a step boundary): a saga_step_executions row for `crashStep`
+     * is already IN_PROGRESS (intent persisted, result never was) when the recovery scanner
+     * claims the saga. Before this fix, resuming would call persistIntent for a fresh
+     * attempt 1, violate uq_step_attempt, and silently stop (see _prep/phase2_plan.md §3
+     * Task 1). This verifies recovery instead reuses the existing row and its key.
+     *
+     * timeout_at is set far in the future so this is isolated from TimeoutScanner — only
+     * OrphanedSagaScanService's resume path is exercised.
+     */
+    @ParameterizedTest(name = "crash mid-step {0}")
+    @ValueSource(ints = {0, 1, 2, 3, 4})
+    void crashMidStep_recoveryReusesExistingKey(int crashStep) throws Exception {
+        UUID sagaId = UUID.randomUUID();
+        String sourceAccountId = "mid-crash-acc-" + crashStep + "-" + sagaId.toString().substring(0, 8);
+
+        TransferContext ctx = preSeedContext(crashStep, sourceAccountId);
+        String contextJson = objectMapper.writeValueAsString(ctx);
+
+        jdbcTemplate.update("""
+            INSERT INTO saga_instance (id, saga_type, status, current_step, context, version,
+                                       lock_owner, heartbeat_at, lease_expires_at, fencing_token,
+                                       created_at, updated_at)
+            VALUES (?, 'fund-transfer', 'EXECUTING', ?, ?::jsonb, 1,
+                    'dead-node-mid-crash-test', ?, ?, 1,
+                    NOW(), NOW())
+            """,
+                sagaId, crashStep, contextJson,
+                Timestamp.from(Instant.now().minus(1, ChronoUnit.HOURS)),
+                Timestamp.from(Instant.now().minus(1, ChronoUnit.HOURS)));
+
+        jdbcTemplate.update("""
+            INSERT INTO saga_entity_locks (entity_type, entity_id, saga_id, acquired_at)
+            VALUES ('account', ?, ?, NOW())
+            """, sourceAccountId, sagaId);
+
+        String preCrashKey = keyGenerator.forwardKey(sagaId, crashStep, 1);
+        jdbcTemplate.update("""
+            INSERT INTO saga_step_executions (id, saga_id, step_index, attempt_number,
+                                               idempotency_key, status, timeout_at, started_at)
+            VALUES (?, ?, ?, 1, ?, 'IN_PROGRESS', ?, NOW())
+            """,
+                UUID.randomUUID(), sagaId, crashStep, preCrashKey,
+                Timestamp.from(Instant.now().plusSeconds(60)));
+
+        orphanedSagaScanService.scan();
+
+        SagaInstance recovered = sagaRepo.findById(sagaId).orElseThrow();
+        assertThat(recovered.getStatus())
+                .as("saga resumed mid-step %d should reach COMPLETED", crashStep)
+                .isEqualTo(SagaStatus.COMPLETED);
+
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(
+                "SELECT attempt_number, idempotency_key, status FROM saga_step_executions " +
+                "WHERE saga_id = ? AND step_index = ?", sagaId, crashStep);
+        assertThat(rows)
+                .as("resume must reuse the existing row, not insert a second attempt")
+                .hasSize(1);
+        assertThat(rows.get(0).get("idempotency_key"))
+                .as("resume must reuse the pre-crash idempotency key, not a new one")
+                .isEqualTo(preCrashKey);
+        assertThat(rows.get(0).get("status")).isEqualTo("COMPLETED");
+
         Integer lockCount = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM saga_entity_locks WHERE saga_id = ?",
                 Integer.class, sagaId);

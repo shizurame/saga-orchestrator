@@ -21,6 +21,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -83,6 +84,18 @@ class StepPersistenceService {
         SagaStepExecution exec = SagaStepExecution.createInProgress(
                 sagaId, stepIndex, attempt, idempotencyKey, timeoutAt);
         return stepRepo.save(exec);
+    }
+
+    /**
+     * Looks up an existing IN_PROGRESS row for (sagaId, stepIndex), if any.
+     *
+     * Used by ForwardExecutionEngine when resuming a step: a crash between persistIntent
+     * and persistResult leaves exactly this kind of row. Reusing it (same row, same
+     * idempotency key) instead of calling persistIntent again is what avoids violating
+     * uq_step_attempt on resume.
+     */
+    public Optional<SagaStepExecution> findInProgress(UUID sagaId, int stepIndex) {
+        return stepRepo.findBySagaIdAndStepIndexAndStatus(sagaId, stepIndex, StepExecutionStatus.IN_PROGRESS);
     }
 
     /**

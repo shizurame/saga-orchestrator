@@ -14,6 +14,7 @@ import org.springframework.stereotype.Component;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.IntStream;
 
@@ -90,19 +91,37 @@ public class ForwardExecutionEngine {
                                      SagaContext context) {
         int maxAttempts = step.retryPolicy().maxAttempts();
 
-        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            String  key       = keyGenerator.forwardKey(sagaId, stepIndex, attempt);
-            Instant timeoutAt = Instant.now().plus(step.timeout());
+        // Resume support: a crash between persistIntent and persistResult leaves this
+        // step's current attempt IN_PROGRESS. Starting a fresh attempt 1 here would
+        // insert a second row for the same (sagaId, stepIndex, attemptNumber) and violate
+        // uq_step_attempt — so reuse that row and its already-persisted idempotency key
+        // instead. Only the step actually being resumed can have such a row (every step
+        // after it has never been attempted), so this lookup is a correctness check, not
+        // an optimization — it costs one cheap read per step and is empty in the common case.
+        Optional<SagaStepExecution> resuming = persistence.findInProgress(sagaId, stepIndex);
+        int startAttempt = resuming.map(SagaStepExecution::getAttemptNumber).orElse(1);
 
-            // Step 1: persist intent — commits before action runs
+        for (int attempt = startAttempt; attempt <= maxAttempts; attempt++) {
+            String key;
             SagaStepExecution execution;
-            try {
-                execution = persistence.persistIntent(sagaId, stepIndex, attempt, key, timeoutAt);
-            } catch (DataIntegrityViolationException e) {
-                // Another node already started this step (uq_step_attempt conflict) — OCC loss
-                log.warn("OCC: another executor already started saga={} step={} attempt={}",
-                        sagaId, stepIndex, attempt);
-                return false;
+
+            if (resuming.isPresent() && attempt == startAttempt) {
+                execution = resuming.get();
+                key = execution.getIdempotencyKey();
+                log.info("Resuming crashed step '{}' saga={} attempt={} with existing key",
+                        step.name(), sagaId, attempt);
+            } else {
+                key = keyGenerator.forwardKey(sagaId, stepIndex, attempt);
+                Instant timeoutAt = Instant.now().plus(step.timeout());
+                // Step 1: persist intent — commits before action runs
+                try {
+                    execution = persistence.persistIntent(sagaId, stepIndex, attempt, key, timeoutAt);
+                } catch (DataIntegrityViolationException e) {
+                    // Another node already started this step (uq_step_attempt conflict) — OCC loss
+                    log.warn("OCC: another executor already started saga={} step={} attempt={}",
+                            sagaId, stepIndex, attempt);
+                    return false;
+                }
             }
 
             // Step 2: execute action (outside any TX)
