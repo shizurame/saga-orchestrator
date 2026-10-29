@@ -81,19 +81,42 @@ public class CompensationEngine {
     }
 
     private void compensateRemaining(UUID sagaId, SagaDefinition<?> definition, SagaContext context) {
-        // Load PENDING and IN_PROGRESS — handles both fresh starts and crash recovery.
-        // Repository returns rows in DESC step_index order (reverse execution order).
+        // Load PENDING, IN_PROGRESS, and FAILED — handles fresh starts and both shapes of
+        // crash recovery. FAILED must be included: a crash right after persistCompensationFailure
+        // commits (before the next retry, or before the DEAD_LETTER transition if that failure
+        // was the last allowed attempt) used to leave the row invisible to this query — silently
+        // skipped forever, with the saga wrongly reaching COMPENSATED despite this step's
+        // compensation never actually completing. Repository returns rows in DESC step_index
+        // order (reverse execution order), so an already-exhausted row is always checked before
+        // any step compensated earlier in forward order.
         List<CompensationStep> remaining = compensationStepRepo
                 .findBySagaIdAndStatusInOrderByStepIndexDesc(
                         sagaId,
-                        List.of(CompensationStatus.PENDING, CompensationStatus.IN_PROGRESS));
+                        List.of(CompensationStatus.PENDING, CompensationStatus.IN_PROGRESS,
+                                CompensationStatus.FAILED));
 
         for (CompensationStep compStep : remaining) {
             SagaStep stepDef  = definition.stepAt(compStep.getStepIndex());
             int maxAttempts   = stepDef.retryPolicy().maxAttempts();
-            boolean succeeded = false;
 
-            for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            if (compStep.getStatus() == CompensationStatus.FAILED
+                    && compStep.getAttemptNumber() >= maxAttempts) {
+                // Already exhausted before this resume — the DEAD_LETTER decision itself
+                // never committed. Make it now instead of silently treating this as done.
+                log.error("Compensation for '{}' saga={} was already exhausted before this resume " +
+                        "(crash before DEAD_LETTER committed) → DEAD_LETTER", stepDef.name(), sagaId);
+                persistence.releaseLocksAndTransition(sagaId, SagaEvent.COMPENSATION_EXHAUSTED, stepDef.name());
+                return;
+            }
+
+            boolean succeeded = false;
+            // Continue from the next attempt — not always 1 — so a crash between retries
+            // doesn't grant extra attempts beyond maxAttempts, and so a FAILED-but-not-
+            // exhausted row (attemptNumber < maxAttempts) actually gets retried here instead
+            // of restarting from scratch.
+            int startAttempt = compStep.getAttemptNumber() + 1;
+
+            for (int attempt = startAttempt; attempt <= maxAttempts; attempt++) {
                 // Step 1: persist intent — marks IN_PROGRESS and increments attemptNumber.
                 // The idempotency key is always compensationKey(sagaId, stepIndex, 0) —
                 // same across all retries so the participant can return a cached result.

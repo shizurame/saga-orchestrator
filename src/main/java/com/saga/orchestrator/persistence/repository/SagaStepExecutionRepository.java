@@ -44,4 +44,12 @@ public interface SagaStepExecutionRepository extends JpaRepository<SagaStepExecu
                       @Param("newTimeoutAt") Timestamp newTimeoutAt);
 
     List<SagaStepExecution> findBySagaIdOrderByStepIndexAscAttemptNumberAsc(UUID sagaId);
+
+    /**
+     * Resume query: the highest-attempt row for (sagaId, stepIndex), regardless of status.
+     * Used to continue retries correctly after a crash — without this, a resumed step always
+     * restarted at attempt 1, colliding with uq_step_attempt on any already-FAILED attempt.
+     */
+    Optional<SagaStepExecution> findTopBySagaIdAndStepIndexOrderByAttemptNumberDesc(
+            UUID sagaId, int stepIndex);
 }

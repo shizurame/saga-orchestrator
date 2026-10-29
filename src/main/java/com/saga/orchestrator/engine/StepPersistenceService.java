@@ -99,6 +99,14 @@ class StepPersistenceService {
     }
 
     /**
+     * The highest-attempt row for (sagaId, stepIndex), regardless of status — used on resume
+     * to continue retries from the right attempt number instead of restarting at 1.
+     */
+    public Optional<SagaStepExecution> findLatestAttempt(UUID sagaId, int stepIndex) {
+        return stepRepo.findTopBySagaIdAndStepIndexOrderByAttemptNumberDesc(sagaId, stepIndex);
+    }
+
+    /**
      * Write-ordering step 2 (success path): persist the result and advance the saga.
      * Reloads the saga within this TX so @Version provides OCC against concurrent updates.
      */

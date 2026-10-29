@@ -53,6 +53,8 @@ class Phase5IntegrationTest extends AbstractIntegrationTest {
     private static final String PIVOT_FAIL_TYPE      = "phase5-pivot-fail";
     private static final String NO_COMP_TYPE         = "phase5-no-comp";
     private static final String COMP_RETRY_TYPE      = "phase5-comp-retry";
+    private static final String COMP_FAILED_RETRY_TYPE     = "phase5-comp-failed-retry";
+    private static final String COMP_FAILED_EXHAUSTED_TYPE = "phase5-comp-failed-exhausted";
 
     // Static so lambdas registered on the first JUnit instance write to the same
     // objects that each test's assertions read (JUnit creates a new instance per test
@@ -61,6 +63,10 @@ class Phase5IntegrationTest extends AbstractIntegrationTest {
     private static final AtomicInteger crashResumeCompCount = new AtomicInteger(0);
     private static final AtomicInteger allCompedCompCount   = new AtomicInteger(0);
     private static final AtomicInteger compRetryCount       = new AtomicInteger(0);
+    private static final AtomicInteger compFailedRetryStep1Count     = new AtomicInteger(0);
+    private static final AtomicInteger compFailedRetryStep0Count     = new AtomicInteger(0);
+    private static final AtomicInteger compExhaustedStep1Count       = new AtomicInteger(0);
+    private static final AtomicInteger compExhaustedStep0Count       = new AtomicInteger(0);
 
     private static boolean registered = false;
 
@@ -70,6 +76,10 @@ class Phase5IntegrationTest extends AbstractIntegrationTest {
         crashResumeCompCount.set(0);
         allCompedCompCount.set(0);
         compRetryCount.set(0);
+        compFailedRetryStep1Count.set(0);
+        compFailedRetryStep0Count.set(0);
+        compExhaustedStep1Count.set(0);
+        compExhaustedStep0Count.set(0);
 
         if (registered) return;
         registered = true;
@@ -159,6 +169,36 @@ class Phase5IntegrationTest extends AbstractIntegrationTest {
                 .timeout(Duration.ofSeconds(5), TimeoutMode.RETRY_WITH_IDEMPOTENCY)
             .build();
         registry.register(compRetry);
+
+        // Saga 7: used to test resuming a FAILED-but-not-exhausted compensation step
+        // (crash between persistCompensationFailure committing and the next retry).
+        SagaDefinition<TestCtx> compFailedRetry = SagaDefinition.named(COMP_FAILED_RETRY_TYPE, TestCtx.class)
+            .compensatableStep("cfr-step-0")
+                .action((ctx, key) -> new ExecutionResult.Success(null))
+                .compensation((ctx, key) -> { compFailedRetryStep0Count.incrementAndGet(); return new ExecutionResult.Success(null); })
+                .timeout(Duration.ofSeconds(5), TimeoutMode.RETRY_WITH_IDEMPOTENCY)
+            .compensatableStep("cfr-step-1")
+                .action((ctx, key) -> new ExecutionResult.Success(null))
+                .compensation((ctx, key) -> { compFailedRetryStep1Count.incrementAndGet(); return new ExecutionResult.Success(null); })
+                .timeout(Duration.ofSeconds(5), TimeoutMode.RETRY_WITH_IDEMPOTENCY)
+                .retryPolicy(RetryPolicy.fixed(2, Duration.ZERO))
+            .build();
+        registry.register(compFailedRetry);
+
+        // Saga 8: used to test resuming a FAILED-and-already-exhausted compensation step
+        // (crash between the exhausting failure committing and the DEAD_LETTER transition).
+        SagaDefinition<TestCtx> compFailedExhausted = SagaDefinition.named(COMP_FAILED_EXHAUSTED_TYPE, TestCtx.class)
+            .compensatableStep("cfe-step-0")
+                .action((ctx, key) -> new ExecutionResult.Success(null))
+                .compensation((ctx, key) -> { compExhaustedStep0Count.incrementAndGet(); return new ExecutionResult.Success(null); })
+                .timeout(Duration.ofSeconds(5), TimeoutMode.RETRY_WITH_IDEMPOTENCY)
+            .compensatableStep("cfe-step-1")
+                .action((ctx, key) -> new ExecutionResult.Success(null))
+                .compensation((ctx, key) -> { compExhaustedStep1Count.incrementAndGet(); return new ExecutionResult.Failure("always fails"); })
+                .timeout(Duration.ofSeconds(5), TimeoutMode.RETRY_WITH_IDEMPOTENCY)
+                .retryPolicy(RetryPolicy.fixed(2, Duration.ZERO))
+            .build();
+        registry.register(compFailedExhausted);
     }
 
     @AfterEach
@@ -324,5 +364,93 @@ class Phase5IntegrationTest extends AbstractIntegrationTest {
         assertThat(comps.get(0).getStepIndex()).isEqualTo(0);
         assertThat(comps.get(0).getStatus()).isEqualTo(CompensationStatus.COMPLETED);
         assertThat(comps.get(0).getAttemptNumber()).isEqualTo(2); // incremented twice
+    }
+
+    // ── Test 7 (case c-i): resume a FAILED-but-not-exhausted compensation step ──
+    //
+    // CompensationEngine's resume query only ever loaded [PENDING, IN_PROGRESS] — a FAILED
+    // row (crash right after persistCompensationFailure committed, before the next retry)
+    // was invisible to it. Before the fix, this silently skips step 1 forever and wrongly
+    // marks the saga COMPENSATED despite step 1's compensation never actually succeeding.
+
+    @Test
+    void crashAfterCompensationFailed_retriesRemaining_resumesAndCompletes() throws Exception {
+        String ctxJson = objectMapper.writeValueAsString(new TestCtx());
+        SagaDefinition<?> def = registry.lookup(COMP_FAILED_RETRY_TYPE);
+
+        SagaInstance saga = sagaRepo.save(SagaInstance.create(COMP_FAILED_RETRY_TYPE, ctxJson));
+        saga.setStatus(SagaStatus.COMPENSATING);
+        saga = sagaRepo.save(saga);
+        UUID sagaId = saga.getId();
+
+        com.saga.orchestrator.infrastructure.IdempotencyKeyGenerator kg =
+                new com.saga.orchestrator.infrastructure.IdempotencyKeyGenerator();
+
+        // step 1 (maxAttempts=2): attempt 1 already FAILED and committed; the crash happened
+        // before attempt 2 could even be tried.
+        CompensationStep step1Comp = CompensationStep.pending(sagaId, 1, "cfr-step-1", kg.compensationKey(sagaId, 1, 0));
+        step1Comp.markInProgress(); // attemptNumber -> 1
+        step1Comp.markFailed();     // status -> FAILED, attemptNumber stays 1
+        // step 0: never started yet
+        CompensationStep step0Comp = CompensationStep.pending(sagaId, 0, "cfr-step-0", kg.compensationKey(sagaId, 0, 0));
+        compStepRepo.saveAll(List.of(step0Comp, step1Comp));
+
+        compensationEngine.compensate(saga, def);
+
+        assertThat(sagaRepo.findById(sagaId).orElseThrow().getStatus())
+                .as("step 1 must actually be retried (and succeed) before the saga is COMPENSATED")
+                .isEqualTo(SagaStatus.COMPENSATED);
+        assertThat(compFailedRetryStep1Count.get())
+                .as("step 1's compensation action must actually run on resume, not be silently skipped")
+                .isEqualTo(1);
+        assertThat(compFailedRetryStep0Count.get()).isEqualTo(1);
+
+        CompensationStep finalStep1 = compStepRepo.findById(step1Comp.getId()).orElseThrow();
+        assertThat(finalStep1.getStatus()).isEqualTo(CompensationStatus.COMPLETED);
+        assertThat(finalStep1.getAttemptNumber()).isEqualTo(2); // 1 (pre-seeded) + 1 (resumed retry)
+    }
+
+    // ── Test 8 (case c-ii): resume a FAILED-and-already-exhausted compensation step ──
+    //
+    // Same invisibility bug, but for a row whose last attempt already reached maxAttempts —
+    // the DEAD_LETTER transition itself never committed. Before the fix, this is also
+    // invisible to the resume query, so the saga is wrongly marked COMPENSATED (or, if other
+    // steps are still pending, just silently proceeds without ever reaching DEAD_LETTER).
+
+    @Test
+    void crashAfterCompensationExhausted_beforeDeadLetterCommitted_reachesDeadLetter() throws Exception {
+        String ctxJson = objectMapper.writeValueAsString(new TestCtx());
+        SagaDefinition<?> def = registry.lookup(COMP_FAILED_EXHAUSTED_TYPE);
+
+        SagaInstance saga = sagaRepo.save(SagaInstance.create(COMP_FAILED_EXHAUSTED_TYPE, ctxJson));
+        saga.setStatus(SagaStatus.COMPENSATING);
+        saga = sagaRepo.save(saga);
+        UUID sagaId = saga.getId();
+
+        com.saga.orchestrator.infrastructure.IdempotencyKeyGenerator kg =
+                new com.saga.orchestrator.infrastructure.IdempotencyKeyGenerator();
+
+        // step 1 (maxAttempts=2): both attempts already FAILED and committed — genuinely
+        // exhausted — but the crash happened before releaseLocksAndTransition(DEAD_LETTER)
+        // could commit.
+        CompensationStep step1Comp = CompensationStep.pending(sagaId, 1, "cfe-step-1", kg.compensationKey(sagaId, 1, 0));
+        step1Comp.markInProgress(); // attemptNumber -> 1
+        step1Comp.markFailed();
+        step1Comp.markInProgress(); // attemptNumber -> 2
+        step1Comp.markFailed();     // status -> FAILED, attemptNumber == maxAttempts
+        CompensationStep step0Comp = CompensationStep.pending(sagaId, 0, "cfe-step-0", kg.compensationKey(sagaId, 0, 0));
+        compStepRepo.saveAll(List.of(step0Comp, step1Comp));
+
+        compensationEngine.compensate(saga, def);
+
+        assertThat(sagaRepo.findById(sagaId).orElseThrow().getStatus())
+                .as("an already-exhausted compensation step must reach DEAD_LETTER, not be silently treated as done")
+                .isEqualTo(SagaStatus.DEAD_LETTER);
+        assertThat(compExhaustedStep1Count.get())
+                .as("an already-exhausted step must not be retried again")
+                .isEqualTo(0);
+        assertThat(compExhaustedStep0Count.get())
+                .as("step 0 must never run — step 1 (checked first, DESC order) is already dead-lettered")
+                .isEqualTo(0);
     }
 }

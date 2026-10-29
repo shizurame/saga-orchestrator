@@ -103,15 +103,33 @@ public class ForwardExecutionEngine {
                                      SagaContext context) {
         int maxAttempts = step.retryPolicy().maxAttempts();
 
-        // Resume support: a crash between persistIntent and persistResult leaves this
-        // step's current attempt IN_PROGRESS. Starting a fresh attempt 1 here would
-        // insert a second row for the same (sagaId, stepIndex, attemptNumber) and violate
-        // uq_step_attempt — so reuse that row and its already-persisted idempotency key
-        // instead. Only the step actually being resumed can have such a row (every step
-        // after it has never been attempted), so this lookup is a correctness check, not
-        // an optimization — it costs one cheap read per step and is empty in the common case.
+        // Resume support: a crash can leave this step in one of two recoverable states —
+        // restarting at a fresh attempt 1 in either case would collide with an already-
+        // existing row via uq_step_attempt and silently stall (both shapes of the same bug):
+        //   - an IN_PROGRESS row (crash between persistIntent and persistResult) — reuse it.
+        //   - one or more FAILED rows, no IN_PROGRESS row (crash after a failure committed,
+        //     before the next retry — or the compensate-or-fail decision after the LAST
+        //     allowed attempt — ever committed). Continue from the next attempt number; if
+        //     the last FAILED row was already the final allowed attempt, the compensate-or-
+        //     fail decision itself never happened, so make it now instead of trying again.
+        // Only the step actually being resumed can have any such row (every step after it has
+        // never been attempted), so these lookups are a correctness check on every step entry,
+        // not an optimization — cheap, and empty in the common case.
         Optional<SagaStepExecution> resuming = persistence.findInProgress(sagaId, stepIndex);
-        int startAttempt = resuming.map(SagaStepExecution::getAttemptNumber).orElse(1);
+        int startAttempt;
+        if (resuming.isPresent()) {
+            startAttempt = resuming.get().getAttemptNumber();
+        } else {
+            Optional<SagaStepExecution> latest = persistence.findLatestAttempt(sagaId, stepIndex);
+            if (latest.isPresent() && latest.get().getAttemptNumber() >= maxAttempts) {
+                log.warn("Step '{}' saga={} already exhausted all {} attempts before this resume " +
+                        "(crash before the compensate-or-fail decision committed) — deciding now",
+                        step.name(), sagaId, maxAttempts);
+                triggerCompensationOrFail(sagaId, definition, stepIndex, step.name());
+                return false;
+            }
+            startAttempt = latest.map(e -> e.getAttemptNumber() + 1).orElse(1);
+        }
 
         for (int attempt = startAttempt; attempt <= maxAttempts; attempt++) {
             String key;
