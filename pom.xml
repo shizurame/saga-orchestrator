@@ -183,4 +183,46 @@
         </plugins>
     </build>
 
+    <profiles>
+        <!-- Active unless another profile is explicitly selected (Maven deactivates
+             activeByDefault profiles automatically when -P names a different one — this
+             is what lets "benchmark" below cleanly NOT inherit this exclusion, with no
+             need to override/clear an already-set <excludedGroups> element). -->
+        <profile>
+            <id>default-test-set</id>
+            <activation>
+                <activeByDefault>true</activeByDefault>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <!-- @Tag("benchmark") alone excludes nothing under plain JUnit 5 +
+                                 Surefire; this is what actually makes the exclusion real. -->
+                            <excludedGroups>benchmark</excludedGroups>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- mvn test -Pbenchmark runs ONLY the JMH suite (BenchmarkSuiteTest, @Tag("benchmark")). -->
+        <profile>
+            <id>benchmark</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <groups>benchmark</groups>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
 </project>
