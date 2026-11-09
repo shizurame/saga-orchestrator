@@ -545,6 +545,71 @@ second, previously invisible bug.
 
 ---
 
+## Phase 10 — Broader Resume-After-Failure Fix, DEAD_LETTER Coverage, Concurrency (2026-10-29)
+
+**Goal:** Phase 9's mid-step crash fix only covered an `IN_PROGRESS` row at resume. A closer
+look found the same stall could happen after *any* `FAILED` attempt, not only after full
+exhaustion — and the identical bug existed on the compensation side in a different shape.
+Also closed two test-coverage gaps flagged at the end of Phase 9: `DEAD_LETTER` was never
+reached through `CompensationEngine` itself, and nothing proved the orchestrator-side
+concurrent-retry guarantee through the real engine.
+
+- [x] **Broadened the forward-execution resume fix.** `ForwardExecutionEngine.executeWithRetry`
+  now looks up the highest-attempt row for a step regardless of status (new
+  `StepPersistenceService.findLatestAttempt` /
+  `SagaStepExecutionRepository.findTopBySagaIdAndStepIndexOrderByAttemptNumberDesc`): a `FAILED`
+  row with retries left resumes at `attemptNumber + 1`; a `FAILED` row already at `maxAttempts`
+  means the compensate-or-fail decision never committed, so it's made directly instead of
+  inserting a doomed fresh attempt 1. Previously, *any* crash after a `FAILED` attempt — not
+  only after the final one — collided with `uq_step_attempt` on resume and stalled the saga in
+  `EXECUTING` forever.
+- [x] **Found and fixed the same bug in `CompensationEngine`, in a different shape.** Its resume
+  query only ever loaded `[PENDING, IN_PROGRESS]` — a `FAILED` compensation row (crash right
+  after `persistCompensationFailure` committed) was invisible to it, silently skipped forever,
+  letting the saga wrongly reach `COMPENSATED` despite that step's compensation never actually
+  completing (or reach `COMPENSATED` instead of the `DEAD_LETTER` it should have, if that
+  `FAILED` row had already exhausted its retries). Fixed: query now includes `FAILED`; checks
+  for already-exhausted rows before retrying; continues from the row's own attempt count.
+- [x] New tests, each written first to confirm it failed against the unfixed code for the
+  expected reason: `CrashAtEachStepTest.crashAfterFailedAttempt_retriesRemaining_resumesAtNextAttempt`
+  (4 steps), `CrashAtEachStepTest.crashAfterFinalAttemptFailed_beforeCompensationDecision_reachesCorrectTerminal`
+  (5 steps), `Phase5IntegrationTest.crashAfterCompensationFailed_retriesRemaining_resumesAndCompletes`,
+  `Phase5IntegrationTest.crashAfterCompensationExhausted_beforeDeadLetterCommitted_reachesDeadLetter`.
+- [x] **End-to-end `DEAD_LETTER` test.** New saga type whose compensation always fails with
+  `maxAttempts=2`, driven through a real `orchestrator.startSaga` call (not a directly-inserted
+  row) — `Phase5IntegrationTest.compensationGenuinelyExhausted_reachesDeadLetter_withLocksReleased`.
+- [x] **Orchestrator-side concurrency test** (`ConcurrentStepExecutionTest`): several real
+  threads racing through `ForwardExecutionEngine` for the same `(sagaId, stepIndex, attempt)` —
+  the complement `IdempotencyUnder1000RetriesTest`'s name implies but doesn't itself cover,
+  since that test calls the participant directly and never touches the engine.
+- [x] **Writing that test found a new, third bug.** Two threads could both observe the same row
+  as genuinely `IN_PROGRESS` and race to complete it — one legitimately finishing it, the other
+  mistaking it for crash-abandoned. `SagaStepExecution` had no `@Version`, so this race had no
+  atomic resolution; it surfaced as an uncaught `ObjectOptimisticLockingFailureException`, or
+  (after a first, wrong fix that tried catching it inside `persistStepSuccess`'s own
+  transaction) an `UnexpectedRollbackException` instead — a failed JPA flush poisons that
+  transaction's persistence context regardless of whether the translated exception is caught
+  there. Fixed with migration `V5` (`version` column on `saga_step_executions`) + catching the
+  conflict in `ForwardExecutionEngine` at the call site, the same place `persistIntent`'s
+  `uq_step_attempt` conflict is already caught.
+- [x] Fixed remaining imprecise wording: README's "exactly-once execution" → "effectively-once"
+  (two spots); `pom.xml`'s `<description>` dropped "Production-grade" and "exactly-once".
+
+### Phase 10 Notes
+- The concurrency test's own participant had to be a proper idempotent cache
+  (`ConcurrentHashMap.computeIfAbsent` keyed by idempotency key, like every real showcase
+  participant), not a bare counter — a bare counter asserts a *stronger* guarantee than this
+  architecture actually makes ("the action method is called exactly once" vs. "the same key
+  always returns the same cached result"), and failed intermittently for exactly that reason
+  before being corrected.
+- 182/182 tests pass via plain `mvn test`: 169 from Phase 9 + 9 new `CrashAtEachStepTest` cases
+  + 3 new `Phase5IntegrationTest` cases + 1 new `ConcurrentStepExecutionTest`.
+- Full before/after evidence for every fix in this phase — exact log lines, repro steps, and
+  file:line citations — is kept in `_prep/PROJECT_DEEP_DIVE.md` (gitignored, private working
+  notes for CV/interview prep, not part of this repo's own documentation).
+
+---
+
 ## CV Bullets — Final (with benchmark numbers)
 
 ```

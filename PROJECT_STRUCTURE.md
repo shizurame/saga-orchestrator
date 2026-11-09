@@ -170,14 +170,16 @@ goes through this package — no SQL in the engine or infrastructure.
 persistence/
 ├── entity/
 │   ├── SagaInstance.java          ← saga state, @Version (OCC), lock_owner, fencing_token
-│   ├── SagaStepExecution.java     ← per-step-per-attempt: idempotency_key, status, timeout_at, result
+│   ├── SagaStepExecution.java     ← per-step-per-attempt: idempotency_key, status, timeout_at, result,
+│   │                                 @Version (OCC against same-process concurrent-resume races)
 │   ├── CompensationStep.java      ← compensation plan entry: step_index, action, key, status
 │   └── SagaEntityLock.java        ← entity-level lock: (entity_type, entity_id) → saga_id
 └── repository/
     ├── SagaInstanceRepository.java          ← findByStatusIn, claimSaga (native RETURNING)
     ├── SagaInstanceRepositoryCustom.java    ← custom interface for native queries
     ├── SagaInstanceRepositoryImpl.java      ← EntityManager native queries for lease ops
-    ├── SagaStepExecutionRepository.java     ← findTimedOutSteps, findBySagaIdAndStepIndex…
+    ├── SagaStepExecutionRepository.java     ← findTimedOutSteps, findBySagaIdAndStepIndex…,
+    │                                           findTopBySagaIdAndStepIndexOrderByAttemptNumberDesc
     ├── CompensationStepRepository.java      ← findBySagaIdAndStatusIn…OrderByStepIndexDesc
     └── SagaEntityLockRepository.java        ← releaselock() native query with sagaId guard
 ```
@@ -307,27 +309,37 @@ test/java/com/saga/orchestrator/
 ├── integration/
 │   ├── AbstractIntegrationTest.java      ← singleton Testcontainers PostgreSQL; Spring context cached
 │   ├── AbstractWebIntegrationTest.java   ← WebEnvironment.MOCK + MockMvc; shares same container
-│   ├── ApplicationSmokeTest.java         ← context loads, Flyway runs, 4 tables created
+│   ├── ApplicationSmokeTest.java         ← context loads, Flyway applies all 5 migrations, all 4 tables exist
 │   ├── PersistenceIntegrationTest.java   ← round-trip for all 4 entities; OCC; constraint tests
 │   ├── Phase3IntegrationTest.java        ← lock acquire/release; deadlock prevention; heartbeat
 │   ├── Phase4IntegrationTest.java        ← happy path; retry on failure; OCC on concurrent writes
-│   ├── Phase5IntegrationTest.java        ← compensation in reverse; crash recovery; idempotency
+│   ├── Phase5IntegrationTest.java        ← compensation in reverse; crash recovery; idempotency;
+│   │                                       resuming a FAILED-not-exhausted compensation step; an
+│   │                                       exhausted-but-undecided one reaching DEAD_LETTER on
+│   │                                       resume; genuine end-to-end exhaustion into DEAD_LETTER
 │   ├── Phase6IntegrationTest.java        ← timeout modes; callback endpoint; orphaned saga recovery
 │   ├── Phase7ControllerTest.java         ← REST API; entity lock 409; saga status endpoint
 │   ├── Phase8IntegrationTest.java        ← Prometheus metrics counters/timers; DLQ alerting
 │   ├── Phase8WebSocketTest.java          ← WebSocket events emitted per step
-│   ├── CrashAtEachStepTest.java          ← crash at a step boundary (0..4) AND genuinely mid-step
-│   │                                       (IN_PROGRESS row reused, not re-attempted) — scanner recovers all
+│   ├── CrashAtEachStepTest.java          ← every recoverable crash point for all 5 steps: at a step
+│   │                                       boundary, genuinely mid-step (IN_PROGRESS reused), after
+│   │                                       a FAILED attempt with retries left (resumes at the next
+│   │                                       attempt), and after the final FAILED attempt before the
+│   │                                       compensate-or-fail decision commits (decided on resume,
+│   │                                       not retried into a doomed fresh attempt 1)
 │   ├── ConcurrentSagaSameAccountTest.java ← entity lock serialization under WAIT_FOR_CALLBACK
 │   ├── CompensationUnderCrashTest.java   ← crash mid-compensation; scanner resumes correctly
-│   └── IdempotencyUnder1000RetriesTest.java ← 1000 concurrent callers, same key → 1 execution
-│                                             (proves the participant's cache, not the orchestrator's
-│                                              write path — see ARCHITECTURE.md)
+│   ├── IdempotencyUnder1000RetriesTest.java ← 1000 concurrent callers, same key → 1 execution
+│   │                                         (proves the participant's cache, not the orchestrator's
+│   │                                          write path — see ARCHITECTURE.md)
+│   └── ConcurrentStepExecutionTest.java  ← the orchestrator-side complement: real concurrent threads
+│                                            through ForwardExecutionEngine for the same saga/step/
+│                                            attempt — one intent row, participant sees ≤1 real execution
 └── benchmark/
     └── BenchmarkSuiteTest.java           ← @Tag("benchmark"); runs JMH via Surefire
 ```
 
-169 tests total — all pass via plain `mvn test`. Benchmarks are a separate Maven profile
+182 tests total — all pass via plain `mvn test`. Benchmarks are a separate Maven profile
 (`mvn test -Pbenchmark`), not part of that count — see pom.xml's `benchmark` profile.
 
 ---

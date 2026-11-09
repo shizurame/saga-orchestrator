@@ -88,7 +88,7 @@ The participant returns its cached result. Exactly one execution, regardless of 
 # Start PostgreSQL
 docker-compose up -d
 
-# Run all tests (169 tests including chaos and integration; benchmarks excluded)
+# Run all tests (182 tests including chaos and integration; benchmarks excluded)
 mvn test
 
 # Run benchmarks only (separate Maven profile — see pom.xml)
@@ -151,14 +151,18 @@ See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full interpretation.
 |------|----------------|
 | `CrashAtEachStepTest.crashAtStep_recoveryResumesSagaToCompleted` (parameterized 0..4) | Scanner claims and resumes correctly from a crash at a step *boundary* (no step in flight) |
 | `CrashAtEachStepTest.crashMidStep_recoveryReusesExistingKey` (parameterized 0..4) | Scanner resumes a step genuinely IN_PROGRESS (crash between intent and result) by reusing the existing row/key, not starting a new attempt |
+| `CrashAtEachStepTest.crashAfterFailedAttempt_retriesRemaining_resumesAtNextAttempt` (parameterized) | Crash after a `FAILED` attempt with retries left resumes at the next attempt number, not a fresh attempt 1 |
+| `CrashAtEachStepTest.crashAfterFinalAttemptFailed_beforeCompensationDecision_reachesCorrectTerminal` (parameterized 0..4) | Crash after the *last* allowed attempt fails, before the compensate-or-fail decision commits — resume makes that decision directly instead of stalling forever |
+| `Phase5IntegrationTest.crashAfterCompensationFailed_retriesRemaining_resumesAndCompletes` / `.crashAfterCompensationExhausted_beforeDeadLetterCommitted_reachesDeadLetter` | The same two crash shapes, on the compensation side — a `FAILED` compensation row used to be invisible to the resume query and silently skipped forever |
+| `Phase5IntegrationTest.compensationGenuinelyExhausted_reachesDeadLetter_withLocksReleased` | Genuine (non-crash) compensation exhaustion reaches `DEAD_LETTER` through `CompensationEngine` itself, with locks released |
+| `ConcurrentStepExecutionTest` | Several real threads racing through the actual `ForwardExecutionEngine` for the same saga/step/attempt — exactly one intent row persisted, participant's cache sees at most one real execution |
 | `StaleWriterRejectedTest` | A node whose fencing token is stale gets `FencedOutException` and writes nothing; the new owner's write with the correct token succeeds |
 | `IdempotencyUnder1000RetriesTest` | 1000 concurrent callers with the same key → exactly 1 execution (proves the **participant's** dedup cache, not the orchestrator's write path — see ARCHITECTURE.md) |
 | `ConcurrentSagaSameAccountTest` | Entity lock serializes two sagas; second blocked until first completes |
 | `CompensationUnderCrashTest` | Mid-compensation crash; scanner resumes; all steps compensated |
-| `Phase5IntegrationTest` | Reverse ordering; crash recovery; idempotent compensation |
 | `Phase6IntegrationTest` | All three timeout modes; callback delivery; orphan recovery |
 
-169 tests, 0 mocks for the database — all integration tests run against a real PostgreSQL instance
+182 tests, 0 mocks for the database — all integration tests run against a real PostgreSQL instance
 via Testcontainers. Quartz auto-startup disabled in tests; scanner services are injected directly.
 Benchmarks (`BenchmarkSuiteTest`, JMH) are a separate Maven profile (`mvn test -Pbenchmark`), not
 part of this count.

@@ -568,8 +568,17 @@ and then every 30 seconds:
 3. On successful claim: re-read current step + status + attempt_number
 4. Resume from last persisted state:
    - `step_status = IN_PROGRESS` → retry the step with the existing idempotency key
-   - `status = EXECUTING` → advance to next step
-   - `status = COMPENSATING` → resume compensation from last PENDING compensation step
+   - `step_status = FAILED`, retries remaining → retry at `attempt_number + 1`, not a fresh
+     attempt 1 (restarting at 1 would collide with the already-`FAILED` row via
+     `uq_step_attempt` and silently stall — this is exactly the bug a later round of hardening
+     found and fixed; see `CrashAtEachStepTest`)
+   - `step_status = FAILED`, already at `max_attempts` → the compensate-or-fail decision after
+     that failure never committed; make it now instead of trying a doomed fresh attempt
+   - `status = EXECUTING` (no in-progress/failed row yet for the current step) → advance to next step
+   - `status = COMPENSATING` → resume compensation from the last `PENDING`, `IN_PROGRESS`, or
+     `FAILED` compensation step, applying the identical "retry from its own attempt count, or
+     decide now if already exhausted" logic — `CompensationEngine`'s resume query used to
+     exclude `FAILED` rows entirely, silently skipping a step's compensation forever
    - `status = WAITING_FOR_CALLBACK` → leave parked; timeout scanner handles expiry
 
 ### What Makes Recovery Correct
@@ -578,6 +587,11 @@ and then every 30 seconds:
 - The attempt number is persisted before the call is made — so on restart, we always know what attempt we're on
 - The compensation plan is already written — on restart in COMPENSATING state, the compensation_steps table has everything needed
 - The fencing token prevents the old owner from interfering if it wakes up late
+- `saga_step_executions` carries its own `@Version` column (migration `V5`), independent of the
+  fencing token — it protects against a *same-process* race the fencing token doesn't cover:
+  two callers both treating the same row as resumable at nearly the same instant (one
+  genuinely finishing it, one mistaking it for abandoned). The loser's write is rejected
+  cleanly instead of silently double-processing or corrupting the saga's advancement.
 
 ---
 
@@ -613,6 +627,7 @@ saga_step_executions (
     completed_at     TIMESTAMP,
     result           JSONB,
     error            JSONB,
+    version          BIGINT        NOT NULL DEFAULT 0,  -- V5: OCC against same-process resume races
     UNIQUE (saga_id, step_index, attempt_number),
     UNIQUE (idempotency_key)
 );
